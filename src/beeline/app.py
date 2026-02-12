@@ -9,40 +9,63 @@ from argparse import ArgumentParser
 import pathlib
 import asyncio
 from datetime import datetime
-
+from .inputs import DirPath, FilePath
 
 import argparse
-
-parser = argparse.ArgumentParser()
-parser.add_argument("--choices", choices=["a", "b", "c"])
-parser.add_argument("--input_dir", type=pathlib.Path)
-parser.add_argument("--input_file", type=pathlib.Path)
+import sys
+import io
+from typing import Callable, Optional
 
 # Optional: restrict to specific types, e.g. ["json", "csv"]
 FILE_TYPES = None  # None = all files
 
-# Ipsum lines for terminal stress test (every 0.5s for 30s)
-IPSUM_LINES = [
-    "Lorem ipsum dolor sit amet, consectetur adipiscing elit.",
-    "Sed do eiusmod tempor incididunt ut labore et dolore magna aliqua.",
-    "Ut enim ad minim veniam, quis nostrud exercitation ullamco laboris.",
-    "Duis aute irure dolor in reprehenderit in voluptate velit esse cillum.",
-    "Excepteur sint occaecat cupidatat non proident, sunt in culpa.",
-]
+
+class _StdoutToTerminal(io.TextIOBase):
+    """Wraps stdout so writes are also sent to the BeeLine terminal widget."""
+
+    def __init__(self, log_to_terminal, original_stdout):
+        self._log = log_to_terminal
+        self._original = original_stdout
+        self._buffer = ""
+
+    def write(self, s):
+        self._original.write(s)
+        if not s:
+            return 0
+        self._buffer += s
+        while "\n" in self._buffer:
+            line, self._buffer = self._buffer.split("\n", 1)
+            self._log(line)
+        return len(s)
+
+    def flush(self):
+        if self._buffer:
+            self._log(self._buffer)
+            self._buffer = ""
+        self._original.flush()
 
 
 class BeeLine(toga.App):
-    def __init__(self, parser: ArgumentParser):
+    def __init__(
+        self,
+        parser: ArgumentParser,
+        *,
+        formal_name: str = "BeeLine",
+        app_id: str = "org.openneuropet.beeline",
+        on_run: Optional[Callable[["BeeLine", argparse.Namespace], None]] = None,
+    ):
+        self.parser = parser
         # Store parser actions before calling super().__init__()
         self.parser_actions = parser._actions
         # (dest, widget) for each argument - widget.value gives current value
         self.arg_widgets = []
         # Terminal output widget (set in startup)
         self.terminal_output = None
+        self._on_run = on_run
         # Initialize the parent Toga App class with required parameters
         super().__init__(
-            formal_name="BeeLine",
-            app_id="org.openneuropet.beeline",
+            formal_name=formal_name,
+            app_id=app_id,
             startup=self.startup,
         )
 
@@ -52,18 +75,19 @@ class BeeLine(toga.App):
         def on_browse(widget, **kwargs):
             # Create a task to handle the async dialog
             async def show_dialog():
-                is_folder = path_type_selection.value == "Folder"
-                if is_folder:
+                if path_type_selection is DirPath:
                     dialog = toga.SelectFolderDialog(
                         title="Choose a folder",
                         multiple_select=False,
                     )
-                else:
+                elif path_type_selection is FilePath:
                     dialog = toga.OpenFileDialog(
                         title="Choose a file",
                         file_types=FILE_TYPES,
                         multiple_select=False,
                     )
+                else:
+                    pass
                 path = await self.main_window.dialog(dialog)
                 if path is not None:
                     path_input.value = str(path)
@@ -77,6 +101,30 @@ class BeeLine(toga.App):
         """Collect current values from all argument widgets into a dictionary."""
         return {dest: widget.value for dest, widget in self.arg_widgets}
 
+    def parse_arguments(self) -> argparse.Namespace:
+        """Build argv from current widget values and parse with the app's parser.
+
+        Returns an argparse.Namespace with types applied (e.g. DirPath, FilePath).
+        Raises if required args are missing or validation fails.
+        """
+        dest_to_action = {
+            a.dest: a for a in self.parser_actions if a.dest != "help"
+        }
+        argv = []
+        for dest, widget in self.arg_widgets:
+            action = dest_to_action[dest]
+            value = widget.value
+            if value is None or (
+                isinstance(value, str) and value.strip() == ""
+            ):
+                if not action.required:
+                    continue
+            option_strings = getattr(action, "option_strings", [])
+            if option_strings:
+                argv.append(option_strings[0])
+            argv.append(str(value) if value is not None else "")
+        return self.parser.parse_args(argv)
+
     def log_to_terminal(self, text):
         """Append text to the terminal output area and scroll to bottom."""
         if not self.terminal_output:
@@ -89,29 +137,33 @@ class BeeLine(toga.App):
             pass
 
     def on_run(self, widget, **kwargs):
-        """Collect arguments, log to terminal, stream ipsum for 30s, then show popup."""
-        args_dict = self.collect_arguments()
+        """Parse args from the form, log to terminal, then call on_run callback if set."""
+        try:
+            args = self.parse_arguments()
+        except (SystemExit, ValueError) as e:
+            self.log_to_terminal(
+                f"Validation error: {e}\n"
+            )
+            return
 
         # Log to terminal
         timestamp = datetime.now().strftime("%H:%M:%S")
-        self.log_to_terminal(f"[{timestamp}] Run pressed. Arguments:")
-        for k, v in args_dict.items():
+        self.log_to_terminal(f"[{timestamp}] Run pressed. Parsed arguments:")
+        for k, v in vars(args).items():
             self.log_to_terminal(f"  {k}: {v!r}")
         self.log_to_terminal("")
-        self.log_to_terminal("Streaming ipsum every 0.5s for 30s…")
-        self.log_to_terminal("")
 
-        async def ipsum_stream():
-            """Log a line of ipsum every 0.5s for 30 seconds."""
-            for i in range(60):  # 60 * 0.5s = 30s
-                await asyncio.sleep(0.5)
-                line = IPSUM_LINES[i % len(IPSUM_LINES)]
-                ts = datetime.now().strftime("%H:%M:%S")
-                self.log_to_terminal(f"  [{ts}] {line}")
-            self.log_to_terminal("")
-            self.log_to_terminal("Ipsum stream finished.")
+        if self._on_run is not None:
+            try:
+                self._on_run(self, args)
+            except Exception as e:
+                self.log_to_terminal(f"Error in on_run callback: {e}\n")
+                import traceback
+                self.log_to_terminal(traceback.format_exc())
+            return
 
-        asyncio.create_task(ipsum_stream())
+        # No callback set - nothing to do
+        self.log_to_terminal("No on_run callback set. Nothing to execute.\n")
 
     def startup(self):
         """Construct and show the Toga application.
@@ -140,25 +192,21 @@ class BeeLine(toga.App):
                         style=Pack(direction=ROW, margin=10),
                     )
                 )
-            elif action.type is pathlib.Path:
+            elif action.type is DirPath or action.type is FilePath:
                 path_input = toga.TextInput(
                     placeholder="No file or folder selected",
                     style=Pack(flex=1),
                 )
-                path_type_selection = toga.Selection(
-                    items=["File", "Folder"],
-                    style=Pack(margin_left=8, width=100),
-                )
                 browse_btn = toga.Button(
                     "Browse…",
                     on_press=self.create_browse_handler(
-                        path_input, path_type_selection
+                        path_input, action.type
                     ),
                     style=Pack(margin_left=8),
                 )
                 self.arg_widgets.append((action.dest, path_input))
                 path_row = toga.Box(
-                    children=[label, path_input, path_type_selection, browse_btn],
+                    children=[label, path_input, browse_btn],
                     style=Pack(direction=ROW, margin=10),
                 )
                 children.append(path_row)
@@ -191,6 +239,13 @@ class BeeLine(toga.App):
         self.main_window.content = main_content
         self.main_window.show()
 
+        # Route stdout to the terminal widget so any print() (e.g. from on_run callbacks)
+        # appears in the GUI without callbacks needing to know about BeeLine.
+        self._original_stdout = sys.stdout
+        sys.stdout = _StdoutToTerminal(self.log_to_terminal, self._original_stdout)
 
-def main():
+
+def main(parser: Optional[ArgumentParser] = None):
+    if parser is None:
+        parser = ArgumentParser()
     return BeeLine(parser=parser)
