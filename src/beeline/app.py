@@ -107,19 +107,24 @@ class BeeLine(toga.App):
         Returns an argparse.Namespace with types applied (e.g. DirPath, FilePath).
         Raises if required args are missing or validation fails.
         """
-        dest_to_action = {
-            a.dest: a for a in self.parser_actions if a.dest != "help"
-        }
+        dest_to_action = {a.dest: a for a in self.parser_actions if a.dest != "help"}
         argv = []
         for dest, widget in self.arg_widgets:
             action = dest_to_action[dest]
             value = widget.value
-            if value is None or (
-                isinstance(value, str) and value.strip() == ""
-            ):
+            option_strings = getattr(action, "option_strings", [])
+
+            # Boolean (store_true / store_false): append flag only, no value
+            # argparse doesn't set type=bool; these actions have .const set
+            if option_strings and getattr(action, "const", None) is not None:
+                const = action.const
+                if value == const:
+                    argv.append(option_strings[0])
+                continue
+
+            if value is None or (isinstance(value, str) and value.strip() == ""):
                 if not action.required:
                     continue
-            option_strings = getattr(action, "option_strings", [])
             if option_strings:
                 argv.append(option_strings[0])
             argv.append(str(value) if value is not None else "")
@@ -141,9 +146,7 @@ class BeeLine(toga.App):
         try:
             args = self.parse_arguments()
         except (SystemExit, ValueError) as e:
-            self.log_to_terminal(
-                f"Validation error: {e}\n"
-            )
+            self.log_to_terminal(f"Validation error: {e}\n")
             return
 
         # Log to terminal
@@ -159,6 +162,7 @@ class BeeLine(toga.App):
             except Exception as e:
                 self.log_to_terminal(f"Error in on_run callback: {e}\n")
                 import traceback
+
                 self.log_to_terminal(traceback.format_exc())
             return
 
@@ -182,9 +186,17 @@ class BeeLine(toga.App):
             label_text = action.dest.replace("_", " ").title()
             label = toga.Label(label_text, style=Pack(margin_right=10))
 
+            default = (
+                None
+                if action.default is argparse.SUPPRESS
+                else getattr(action, "default", None)
+            )
+
             # determine type of input from the arg parser and map it to the corresponding toga instance
             if action.choices:
                 widget = toga.Selection(items=action.choices)
+                if default is not None and default in action.choices:
+                    widget.value = default
                 self.arg_widgets.append((action.dest, widget))
                 children.append(
                     toga.Box(
@@ -197,11 +209,11 @@ class BeeLine(toga.App):
                     placeholder="No file or folder selected",
                     style=Pack(flex=1),
                 )
+                if default is not None:
+                    path_input.value = str(default)
                 browse_btn = toga.Button(
                     "Browse…",
-                    on_press=self.create_browse_handler(
-                        path_input, action.type
-                    ),
+                    on_press=self.create_browse_handler(path_input, action.type),
                     style=Pack(margin_left=8),
                 )
                 self.arg_widgets.append((action.dest, path_input))
@@ -210,6 +222,68 @@ class BeeLine(toga.App):
                     style=Pack(direction=ROW, margin=10),
                 )
                 children.append(path_row)
+            elif getattr(action, "const", None) is not None:
+                # store_true / store_false: show a Switch (flag only, no value)
+                switch_val = default if default is not None else False
+                if action.const is False:
+                    switch_val = True if default is None else bool(default)
+                widget = toga.Switch(action.dest, value=switch_val, style=Pack())
+                self.arg_widgets.append((action.dest, widget))
+                children.append(
+                    toga.Box(
+                        children=[label, widget],
+                        style=Pack(direction=ROW, margin=10),
+                    )
+                )
+            elif action.type is bool:
+                # explicit type=bool: Show a Switch, pass --flag True/False
+                switch_val = default if default is not None else False
+                widget = toga.Switch(action.dest, value=switch_val, style=Pack())
+                self.arg_widgets.append((action.dest, widget))
+                children.append(
+                    toga.Box(
+                        children=[label, widget],
+                        style=Pack(direction=ROW, margin=10),
+                    )
+                )
+            elif action.type is int:
+                widget = toga.NumberInput(style=Pack(flex=1))
+                if default is not None:
+                    widget.value = int(default)
+                self.arg_widgets.append((action.dest, widget))
+                children.append(
+                    toga.Box(
+                        children=[label, widget],
+                        style=Pack(direction=ROW, margin=10),
+                    )
+                )
+            elif action.type is float:
+                widget = toga.NumberInput(step=0.01, style=Pack(flex=1))
+                if default is not None:
+                    widget.value = float(default)
+                self.arg_widgets.append((action.dest, widget))
+                children.append(
+                    toga.Box(
+                        children=[label, widget],
+                        style=Pack(direction=ROW, margin=10),
+                    )
+                )
+            else:
+                # String or other: single-line text input
+                placeholder = str(default) if default is not None else "Enter value…"
+                widget = toga.TextInput(
+                    placeholder=placeholder,
+                    style=Pack(flex=1),
+                )
+                if default is not None:
+                    widget.value = str(default)
+                self.arg_widgets.append((action.dest, widget))
+                children.append(
+                    toga.Box(
+                        children=[label, widget],
+                        style=Pack(direction=ROW, margin=10),
+                    )
+                )
 
         run_btn = toga.Button("Run", on_press=self.on_run, style=Pack(margin=10))
         children.append(run_btn)
